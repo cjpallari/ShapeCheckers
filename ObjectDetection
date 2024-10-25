@@ -1,0 +1,311 @@
+import cv2
+from ultralytics import YOLO
+import torch
+import numpy as np
+import os
+from datetime import datetime
+import time
+import yaml
+from pathlib import Path
+
+class CustomWeaponDetector:
+    def __init__(self):
+        print("Initializing Custom Weapon Detector...")
+        
+        # Define strict object categories
+        self.object_categories = {
+            # Weapons (high danger)
+            'knife': {'danger_level': 3, 'color': (0, 0, 255), 'threshold': 0.6},
+            'gun': {'danger_level': 3, 'color': (0, 0, 255), 'threshold': 0.6},
+            'weapon': {'danger_level': 3, 'color': (0, 0, 255), 'threshold': 0.6},
+            
+            # Common objects (no danger)
+            'person': {'danger_level': 0, 'color': (0, 255, 0), 'threshold': 0.4},
+            'chair': {'danger_level': 0, 'color': (255, 191, 0), 'threshold': 0.4},
+            'bottle': {'danger_level': 0, 'color': (255, 191, 0), 'threshold': 0.4},
+            'laptop': {'danger_level': 0, 'color': (255, 191, 0), 'threshold': 0.4}
+        }
+        
+        # Setup paths
+        self.setup_paths()
+        
+        # Initialize models
+        self.initialize_models()
+        
+        # Performance tracking
+        self.fps = 0
+        self.frame_count = 0
+        self.start_time = time.time()
+
+    def setup_paths(self):
+        """Setup directory structure"""
+        self.base_dir = Path("weapon_detection")
+        self.models_dir = self.base_dir / "models"
+        self.data_dir = self.base_dir / "datasets"
+        self.output_dir = self.base_dir / "detections"
+        
+        # Create directories
+        for directory in [self.models_dir, self.data_dir, self.output_dir]:
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def initialize_models(self):
+        """Initialize detection models"""
+        try:
+            # Load custom model if available
+            custom_model_path = self.models_dir / "custom_weapon.pt"
+            if custom_model_path.exists():
+                print("Loading custom weapon model...")
+                self.weapon_model = YOLO(str(custom_model_path))
+            else:
+                print("Custom model not found, using default YOLO...")
+                self.weapon_model = YOLO('yolov8n.pt')
+            
+            print("Model loaded successfully!")
+            
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
+
+    def prepare_training_data(self, data_path, yaml_path):
+        """Prepare custom dataset for training"""
+        data_config = {
+            'path': str(data_path),
+            'train': 'train/images',
+            'val': 'val/images',
+            'test': 'test/images',
+            
+            'names': {
+                0: 'knife',
+                1: 'gun',
+                2: 'weapon'
+            },
+            
+            'nc': 3  # number of classes
+        }
+        
+        with open(yaml_path, 'w') as f:
+            yaml.dump(data_config, f)
+        
+        return yaml_path
+
+    def train_custom_model(self, data_yaml, epochs=100):
+        """Train custom weapon detection model"""
+        try:
+            print("Starting custom model training...")
+            
+            # Initialize a new YOLO model for training
+            model = YOLO('yolov8n.pt')
+            
+            # Training configuration
+            results = model.train(
+                data=str(data_yaml),
+                epochs=epochs,
+                imgsz=640,
+                batch=16,
+                name='custom_weapon_detection',
+                patience=20,
+                save=True,
+                device='0' if torch.cuda.is_available() else 'cpu',
+                project=str(self.models_dir)
+            )
+            
+            # Save the best model
+            best_model_path = self.models_dir / "custom_weapon.pt"
+            results.save(str(best_model_path))
+            
+            print(f"Training completed! Model saved to {best_model_path}")
+            
+            # Reload the new model
+            self.weapon_model = YOLO(str(best_model_path))
+            
+        except Exception as e:
+            print(f"Error during training: {e}")
+            raise
+
+    def init_camera(self):
+        """Initialize camera with optimal settings"""
+        print("Initializing camera...")
+        camera_methods = [
+            lambda: cv2.VideoCapture(0),
+            lambda: cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION),
+            lambda: cv2.VideoCapture(1)
+        ]
+        
+        for method in camera_methods:
+            cap = method()
+            if cap.isOpened():
+                ret, test_frame = cap.read()
+                if ret:
+                    print("Camera initialized successfully!")
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    cap.set(cv2.CAP_PROP_FPS, 30)
+                    return cap
+                cap.release()
+        
+        raise RuntimeError("Could not initialize camera!")
+
+    def process_detections(self, frame, results):
+        """Process and filter detections"""
+        detected_objects = {
+            'weapons': [],
+            'common': []
+        }
+        
+        annotated_frame = frame.copy()
+        
+        if results and len(results) > 0:
+            for r in results:
+                boxes = r.boxes
+                for box in boxes:
+                    # Get detection details
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    cls_name = self.weapon_model.names[cls].lower()
+                    
+                    # Check if class is in our categories
+                    if cls_name in self.object_categories:
+                        category = self.object_categories[cls_name]
+                        
+                        # Apply class-specific threshold
+                        if conf > category['threshold']:
+                            # Get coordinates
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            
+                            # Draw box with category color
+                            cv2.rectangle(annotated_frame, 
+                                        (x1, y1), (x2, y2), 
+                                        category['color'], 
+                                        2)
+                            
+                            # Add label
+                            label = f'{cls_name} ({conf:.2f})'
+                            labelSize = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                            
+                            # Draw label background
+                            cv2.rectangle(annotated_frame,
+                                        (x1, y1 - labelSize[1] - 10),
+                                        (x1 + labelSize[0], y1),
+                                        category['color'],
+                                        -1)
+                            
+                            # Draw label text
+                            cv2.putText(annotated_frame,
+                                      label,
+                                      (x1, y1 - 5),
+                                      cv2.FONT_HERSHEY_SIMPLEX,
+                                      0.5,
+                                      (255, 255, 255),
+                                      2)
+                            
+                            # Add warning for weapons
+                            if category['danger_level'] >= 3:
+                                cv2.putText(annotated_frame,
+                                          "DANGER: WEAPON!",
+                                          (x1, y2 + 25),
+                                          cv2.FONT_HERSHEY_SIMPLEX,
+                                          0.8,
+                                          (0, 0, 255),
+                                          2)
+                                detected_objects['weapons'].append(cls_name)
+                            else:
+                                detected_objects['common'].append(cls_name)
+        
+        return annotated_frame, detected_objects
+
+    def run_detection(self):
+        """Run real-time detection"""
+        try:
+            cap = self.init_camera()
+            
+            print("\nStarting detection...")
+            print("Controls:")
+            print("- Press 'q' to quit")
+            print("- Press 's' to save current frame")
+            print("- Press 'h' to toggle help")
+            
+            show_help = False
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Failed to grab frame!")
+                    continue
+                
+                # Update FPS
+                self.frame_count += 1
+                if time.time() - self.start_time > 1:
+                    self.fps = self.frame_count / (time.time() - self.start_time)
+                    self.frame_count = 0
+                    self.start_time = time.time()
+                
+                # Run detection
+                results = self.weapon_model(frame, verbose=False)
+                
+                # Process detections
+                annotated_frame, detected_objects = self.process_detections(frame, results)
+                
+                # Draw FPS
+                cv2.putText(annotated_frame, 
+                           f'FPS: {int(self.fps)}',
+                           (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX,
+                           1,
+                           (0, 255, 0),
+                           2)
+                
+                # Draw detections summary
+                y_pos = 60
+                if detected_objects['weapons']:
+                    text = "⚠️ WEAPONS: " + ", ".join(detected_objects['weapons'])
+                    cv2.putText(annotated_frame, text, (10, y_pos),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    y_pos += 30
+                
+                if detected_objects['common']:
+                    text = "Objects: " + ", ".join(detected_objects['common'])
+                    cv2.putText(annotated_frame, text, (10, y_pos),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 191, 0), 2)
+                
+                # Show frame
+                cv2.imshow('Weapon Detection System', annotated_frame)
+                
+                # Handle key presses
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('s'):
+                    # Save frame if weapons detected
+                    if detected_objects['weapons']:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        save_path = self.output_dir / f"weapon_detection_{timestamp}.jpg"
+                        cv2.imwrite(str(save_path), annotated_frame)
+                        print(f"Frame saved to {save_path}")
+                elif key == ord('h'):
+                    show_help = not show_help
+        
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+
+def main():
+    # Initialize detector
+    detector = CustomWeaponDetector()
+    
+    # Example of training custom model (uncomment to use)
+    """
+    # Prepare training data
+    data_yaml = detector.prepare_training_data(
+        detector.data_dir,
+        detector.models_dir / "custom_data.yaml"
+    )
+    
+    # Train custom model
+    detector.train_custom_model(data_yaml, epochs=100)
+    """
+    
+    # Run detection
+    detector.run_detection()
+
+if __name__ == "__main__":
+    main()
